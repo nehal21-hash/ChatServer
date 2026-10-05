@@ -1,0 +1,9 @@
+# Build output
+/server
+/client
+*.o
+*.dSYM/
+
+# OS / editor
+.DS_Store
+.vscode/
