@@ -60,6 +60,19 @@ int main(int argc, char* argv[]) {
     std::string host = argc > 1 ? argv[1] : envHost ? envHost : "127.0.0.1";
     std::string port = argc > 2 ? argv[2] : envPort ? envPort : std::to_string(DEFAULT_PORT);
 
+    // Accept "host:port" (e.g. bore.pub:6094) and "[ipv6]:port" in one argument.
+    if (argc <= 2) {
+        size_t colon = host.rfind(':');
+        if (host.size() > 2 && host.front() == '[' && host.find("]:") != std::string::npos) {
+            size_t close = host.find("]:");
+            port = host.substr(close + 2);
+            host = host.substr(1, close - 1);
+        } else if (colon != std::string::npos && host.find(':') == colon) { // exactly one ':'
+            port = host.substr(colon + 1);
+            host = host.substr(0, colon);
+        }
+    }
+
     int fd = connectTo(host, port);
     if (fd < 0) {
         std::cerr << "Could not connect to " << host << ":" << port << std::endl;

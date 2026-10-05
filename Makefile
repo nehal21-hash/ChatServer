@@ -10,7 +10,10 @@ server: src/server.cpp src/common.h
 client: src/client.cpp src/common.h
 	$(CXX) $(CXXFLAGS) src/client.cpp -o client $(LDFLAGS)
 
+share: server
+	./share.sh
+
 clean:
 	rm -f server client
 
-.PHONY: all clean
+.PHONY: all clean share

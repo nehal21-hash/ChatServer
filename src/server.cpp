@@ -148,11 +148,17 @@ private:
         return serv;
     }
 
+    // Tunnels (bore, playit, ...) hand us every visitor from localhost,
+    // so a per-IP limit there would cap the whole tunnel.
+    static bool isLoopback(const std::string& ip) {
+        return ip == "::1" || ip.rfind("127.", 0) == 0;
+    }
+
     // Returns an error message if the connection must be refused.
     std::string reserveSlot(const std::string& ip) {
         std::lock_guard<std::mutex> lock(connMutex_);
         if (connections_ >= MAX_CONNECTIONS) return "Server is full, try again later.";
-        if (connectionsPerIp_[ip] >= MAX_CONNECTIONS_PER_IP)
+        if (!isLoopback(ip) && connectionsPerIp_[ip] >= MAX_CONNECTIONS_PER_IP)
             return "Too many connections from your address.";
         ++connections_;
         ++connectionsPerIp_[ip];
