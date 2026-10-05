@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -53,8 +54,11 @@ static int connectTo(const std::string& host, const std::string& port) {
 int main(int argc, char* argv[]) {
     std::signal(SIGPIPE, SIG_IGN);
 
-    std::string host = argc > 1 ? argv[1] : "127.0.0.1";
-    std::string port = argc > 2 ? argv[2] : std::to_string(DEFAULT_PORT);
+    // Priority: command-line args, then CHAT_HOST / CHAT_PORT, then localhost.
+    const char* envHost = std::getenv("CHAT_HOST");
+    const char* envPort = std::getenv("CHAT_PORT");
+    std::string host = argc > 1 ? argv[1] : envHost ? envHost : "127.0.0.1";
+    std::string port = argc > 2 ? argv[2] : envPort ? envPort : std::to_string(DEFAULT_PORT);
 
     int fd = connectTo(host, port);
     if (fd < 0) {

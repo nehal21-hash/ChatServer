@@ -5,11 +5,15 @@
 #include "common.h"
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <sys/time.h>
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <ctime>
 #include <iostream>
 #include <map>
@@ -24,46 +28,97 @@ struct Client {
     std::string name;
     std::string address;
     std::mutex sendMutex; // one writer at a time per socket
+    bool closed = false;  // guarded by sendMutex; stops writes to a reused fd
 };
+
+// Token bucket: allows short bursts but limits the sustained message rate.
+class RateLimiter {
+public:
+    bool allow() {
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - last_).count();
+        last_ = now;
+        tokens_ = std::min(RATE_BURST, tokens_ + elapsed * RATE_PER_SEC);
+        if (tokens_ < 1.0) return false;
+        tokens_ -= 1.0;
+        return true;
+    }
+
+private:
+    double tokens_ = RATE_BURST;
+    std::chrono::steady_clock::time_point last_ = std::chrono::steady_clock::now();
+};
+
+static void setTimeout(int fd, int option, int seconds) {
+    timeval tv{};
+    tv.tv_sec = seconds;
+    setsockopt(fd, SOL_SOCKET, option, &tv, sizeof(tv));
+}
 
 class ChatServer {
 public:
     explicit ChatServer(int port) : port_(port) {}
 
+    // Listens on IPv6 and IPv4 at once when possible, else IPv4 only.
     bool start() {
-        listenFd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (listenFd_ < 0) { perror("socket"); return false; }
+        listenFd_ = ::socket(AF_INET6, SOCK_STREAM, 0);
+        if (listenFd_ >= 0) {
+            int no = 0, yes = 1;
+            setsockopt(listenFd_, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
+            setsockopt(listenFd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
-        int yes = 1;
-        setsockopt(listenFd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(static_cast<uint16_t>(port_));
-
-        if (::bind(listenFd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-            perror("bind");
-            return false;
+            sockaddr_in6 addr{};
+            addr.sin6_family = AF_INET6;
+            addr.sin6_addr = in6addr_any;
+            addr.sin6_port = htons(static_cast<uint16_t>(port_));
+            if (::bind(listenFd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+                ::close(listenFd_);
+                listenFd_ = -1;
+            }
         }
-        if (::listen(listenFd_, 16) < 0) { perror("listen"); return false; }
 
-        log("Server listening on port " + std::to_string(port_));
+        if (listenFd_ < 0) {
+            listenFd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (listenFd_ < 0) { perror("socket"); return false; }
+
+            int yes = 1;
+            setsockopt(listenFd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = INADDR_ANY;
+            addr.sin_port = htons(static_cast<uint16_t>(port_));
+            if (::bind(listenFd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+                perror("bind");
+                return false;
+            }
+        }
+
+        if (::listen(listenFd_, 64) < 0) { perror("listen"); return false; }
+
+        log("Server listening on port " + std::to_string(port_) + " (IPv4 + IPv6)");
         return true;
     }
 
     void run() {
         while (true) {
-            sockaddr_in clientAddr{};
+            sockaddr_storage clientAddr{};
             socklen_t len = sizeof(clientAddr);
             int fd = ::accept(listenFd_, reinterpret_cast<sockaddr*>(&clientAddr), &len);
             if (fd < 0) { perror("accept"); continue; }
 
-            char ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &clientAddr.sin_addr, ip, sizeof(ip));
-            std::string address = std::string(ip) + ":" + std::to_string(ntohs(clientAddr.sin_port));
+            std::string ip = ipOf(clientAddr, len);
+            std::string reason = reserveSlot(ip);
+            if (!reason.empty()) {
+                log("Rejected " + ip + ": " + reason);
+                sendLine(fd, "ERR " + reason);
+                ::close(fd);
+                continue;
+            }
 
-            std::thread(&ChatServer::handleClient, this, fd, address).detach();
+            setTimeout(fd, SO_SNDTIMEO, SEND_TIMEOUT_SEC);
+            std::string address = ip + " port " + portOf(clientAddr, len);
+            std::thread(&ChatServer::handleClient, this, fd, ip, address).detach();
         }
     }
 
@@ -72,6 +127,43 @@ private:
     int listenFd_ = -1;
     std::mutex clientsMutex_;
     std::map<std::string, std::shared_ptr<Client>> clients_; // key: lowercase name
+
+    std::mutex connMutex_;
+    int connections_ = 0;
+    std::map<std::string, int> connectionsPerIp_;
+
+    static std::string ipOf(const sockaddr_storage& addr, socklen_t len) {
+        char host[NI_MAXHOST] = "?";
+        getnameinfo(reinterpret_cast<const sockaddr*>(&addr), len, host, sizeof(host),
+                    nullptr, 0, NI_NUMERICHOST);
+        std::string ip = host;
+        if (ip.rfind("::ffff:", 0) == 0) ip = ip.substr(7); // IPv4 client on a dual-stack socket
+        return ip;
+    }
+
+    static std::string portOf(const sockaddr_storage& addr, socklen_t len) {
+        char serv[NI_MAXSERV] = "?";
+        getnameinfo(reinterpret_cast<const sockaddr*>(&addr), len, nullptr, 0,
+                    serv, sizeof(serv), NI_NUMERICSERV);
+        return serv;
+    }
+
+    // Returns an error message if the connection must be refused.
+    std::string reserveSlot(const std::string& ip) {
+        std::lock_guard<std::mutex> lock(connMutex_);
+        if (connections_ >= MAX_CONNECTIONS) return "Server is full, try again later.";
+        if (connectionsPerIp_[ip] >= MAX_CONNECTIONS_PER_IP)
+            return "Too many connections from your address.";
+        ++connections_;
+        ++connectionsPerIp_[ip];
+        return "";
+    }
+
+    void releaseSlot(const std::string& ip) {
+        std::lock_guard<std::mutex> lock(connMutex_);
+        --connections_;
+        if (--connectionsPerIp_[ip] <= 0) connectionsPerIp_.erase(ip);
+    }
 
     static std::string lower(std::string s) {
         std::transform(s.begin(), s.end(), s.begin(), ::tolower);
@@ -102,9 +194,12 @@ private:
         return "";
     }
 
+    // A client whose socket stops accepting data (send timeout) is shut down,
+    // which makes its own thread notice and clean up.
     static void sendTo(Client& c, const std::string& line) {
         std::lock_guard<std::mutex> lock(c.sendMutex);
-        sendLine(c.fd, line);
+        if (c.closed) return;
+        if (!sendLine(c.fd, line)) ::shutdown(c.fd, SHUT_RDWR);
     }
 
     std::vector<std::shared_ptr<Client>> snapshot() {
@@ -128,9 +223,15 @@ private:
     // Handshake: the client sends its name; we answer "OK <name>" or "ERR <reason>"
     // and let it try again until it picks a valid, unused name.
     std::shared_ptr<Client> registerClient(int fd, const std::string& address, LineReader& reader) {
+        setTimeout(fd, SO_RCVTIMEO, HANDSHAKE_TIMEOUT_SEC);
+
         std::string line;
-        while (reader.readLine(line)) {
-            std::string name = trim(line);
+        for (int attempt = 1; attempt <= MAX_NAME_ATTEMPTS; ++attempt) {
+            if (!reader.readLine(line)) {
+                sendLine(fd, "ERR Timed out waiting for a name.");
+                return nullptr;
+            }
+            std::string name = trim(sanitize(line));
             std::string error = validateName(name);
             if (error.empty()) {
                 std::lock_guard<std::mutex> lock(clientsMutex_);
@@ -143,19 +244,22 @@ private:
                     client->address = address;
                     clients_[lower(name)] = client;
                     sendLine(fd, "OK " + name);
+                    setTimeout(fd, SO_RCVTIMEO, 0); // no idle limit once chatting
                     return client;
                 }
             }
             sendLine(fd, "ERR " + error);
         }
+        sendLine(fd, "ERR Too many attempts, disconnecting.");
         return nullptr;
     }
 
-    void handleClient(int fd, std::string address) {
+    void handleClient(int fd, std::string ip, std::string address) {
         LineReader reader(fd);
         auto client = registerClient(fd, address, reader);
         if (!client) {
             ::close(fd);
+            releaseSlot(ip);
             return;
         }
 
@@ -164,11 +268,25 @@ private:
                         "! Type /help for commands. ***");
         broadcast("*** " + client->name + " joined the chat ***");
 
+        RateLimiter limiter;
+        int strikes = 0;
+        bool kicked = false;
+
         std::string line;
         while (reader.readLine(line)) {
-            line = trim(line);
+            line = trim(sanitize(line));
             if (line.empty()) continue;
             if (line.size() > MAX_MSG_LEN) line.resize(MAX_MSG_LEN);
+
+            if (!limiter.allow()) {
+                if (++strikes >= MAX_RATE_STRIKES) {
+                    sendTo(*client, "*** Kicked for spamming. ***");
+                    kicked = true;
+                    break;
+                }
+                sendTo(*client, "*** Slow down! That message was not sent. ***");
+                continue;
+            }
 
             if (line[0] == '/') {
                 if (!handleCommand(*client, line)) break;
@@ -182,9 +300,16 @@ private:
             std::lock_guard<std::mutex> lock(clientsMutex_);
             clients_.erase(lower(client->name));
         }
-        ::close(fd);
-        log(client->name + " left");
-        broadcast("*** " + client->name + " left the chat ***");
+        {
+            std::lock_guard<std::mutex> lock(client->sendMutex);
+            client->closed = true;
+            ::close(fd);
+        }
+        releaseSlot(ip);
+
+        log(client->name + (kicked ? " was kicked for spamming" : " left"));
+        broadcast("*** " + client->name + (kicked ? " was kicked for spamming ***"
+                                                   : " left the chat ***"));
     }
 
     // Returns false if the client asked to disconnect.
@@ -249,6 +374,7 @@ int main(int argc, char* argv[]) {
 
     int port = DEFAULT_PORT;
     if (argc > 1) port = std::atoi(argv[1]);
+    else if (const char* env = std::getenv("CHAT_PORT")) port = std::atoi(env);
     if (port <= 0 || port > 65535) {
         std::cerr << "Usage: " << argv[0] << " [port]" << std::endl;
         return 1;
